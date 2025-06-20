@@ -46,16 +46,32 @@ class LLMProvider(LLMProviderBase):
 
     def response(self, session_id, dialogue, **kwargs):
         try:
+            max_tokens = kwargs.get("max_tokens", self.max_tokens)
+            temperature = kwargs.get("temperature", self.temperature)
+            top_p = kwargs.get("top_p", self.top_p)
+            frequency_penalty = kwargs.get(
+                "frequency_penalty", self.frequency_penalty
+            )
+
+            logger.bind(tag=TAG).info(
+                f"向LLM服务发起请求: \n"
+                f"  URL: {self.base_url}\n"
+                f"  Model: {self.model_name}\n"
+                f"  Max Tokens: {max_tokens}\n"
+                f"  Temperature: {temperature}\n"
+                f"  Top P: {top_p}\n"
+                f"  Frequency Penalty: {frequency_penalty}\n"
+                f"  Dialogue: {dialogue!r}"
+            )
+
             responses = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=dialogue,
                 stream=True,
-                max_tokens=kwargs.get("max_tokens", self.max_tokens),
-                temperature=kwargs.get("temperature", self.temperature),
-                top_p=kwargs.get("top_p", self.top_p),
-                frequency_penalty=kwargs.get(
-                    "frequency_penalty", self.frequency_penalty
-                ),
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                frequency_penalty=frequency_penalty,
             )
 
             is_active = True
@@ -82,10 +98,17 @@ class LLMProvider(LLMProviderBase):
                         yield content
 
         except Exception as e:
-            logger.bind(tag=TAG).error(f"Error in response generation: {e}")
+            logger.bind(tag=TAG).error(f"Error in response generation: {e!r}")
 
     def response_with_functions(self, session_id, dialogue, functions=None):
         try:
+            logger.bind(tag=TAG).info(
+                f"向LLM服务发起(带functions)请求: \n"
+                f"  URL: {self.base_url}\n"
+                f"  Model: {self.model_name}\n"
+                f"  Functions: {functions!r}\n"
+                f"  Dialogue: {dialogue!r}"
+            )
             stream = self.client.chat.completions.create(
                 model=self.model_name, messages=dialogue, stream=True, tools=functions
             )
@@ -106,5 +129,5 @@ class LLMProvider(LLMProviderBase):
                     )
 
         except Exception as e:
-            logger.bind(tag=TAG).error(f"Error in function call streaming: {e}")
-            yield f"【OpenAI服务响应异常: {e}】", None
+            logger.bind(tag=TAG).error(f"Error in function call streaming: {e!r}")
+            yield f"【OpenAI服务响应异常: {e!r}】", None

@@ -80,7 +80,7 @@ async def main():
 
     # 获取WebSocket配置，使用安全的默认值
     websocket_port = 8000
-    server_config = config.get("server", {})
+    server_config = config.get("server") # 获取 server 配置
     if isinstance(server_config, dict):
         websocket_port = int(server_config.get("port", 8000))
 

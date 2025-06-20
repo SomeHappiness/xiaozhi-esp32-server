@@ -4,6 +4,18 @@ from loguru import logger
 from config.config_loader import load_config
 from config.settings import check_config_file
 from datetime import datetime
+import codecs
+
+# Fix for stdout encoding issues on some systems
+if sys.stdout.encoding != "utf-8":
+    try:
+        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "strict")
+        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.buffer, "strict")
+    except Exception:
+        # Fallback for environments where this is not possible (e.g. some IDEs)
+        # In this case, we hope the environment's default encoding is sufficient.
+        pass
+
 
 SERVER_VERSION = "0.5.6"
 _logger_initialized = False

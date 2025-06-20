@@ -3,7 +3,7 @@ import time
 import base64
 from typing import Optional, Dict
 
-import httpx
+import requests  # 使用 requests 替代 httpx
 
 TAG = __name__
 
@@ -20,7 +20,7 @@ class DeviceBindException(Exception):
 
 class ManageApiClient:
     _instance = None
-    _client = None
+    _session = None  # 使用 requests.Session 替代 httpx.Client
     _secret = None
 
     def __new__(cls, config):
@@ -45,25 +45,41 @@ class ManageApiClient:
             raise Exception("请先配置manager-api的secret")
 
         cls._secret = cls.config.get("secret")
-        cls.max_retries = cls.config.get("max_retries", 6)  # 最大重试次数
-        cls.retry_delay = cls.config.get("retry_delay", 10)  # 初始重试延迟(秒)
-        # NOTE(goody): 2025/4/16 http相关资源统一管理，后续可以增加线程池或者超时
-        # 后续也可以统一配置apiToken之类的走通用的Auth
-        cls._client = httpx.Client(
-            base_url=cls.config.get("url"),
-            headers={
-                "User-Agent": f"PythonClient/2.0 (PID:{os.getpid()})",
-                "Accept": "application/json",
-                "Authorization": "Bearer " + cls._secret,
-            },
-            timeout=cls.config.get("timeout", 30),  # 默认超时时间30秒
-        )
+        cls.max_retries = cls.config.get("max_retries", 2)
+        cls.retry_delay = cls.config.get("retry_delay", 5)
+
+        cls._session = requests.Session()  # 创建 Session 对象
+        cls._session.headers.update({
+            "User-Agent": f"PythonClient/2.0 (PID:{os.getpid()})",
+            "Accept": "application/json",
+            "Authorization": "Bearer " + cls._secret,
+        })
+        cls.base_url = cls.config.get("url")
+
+        print(f"DEBUG: Initializing ManageApiClient with requests, secret: {cls._secret}")  # 添加调试信息
 
     @classmethod
     def _request(cls, method: str, endpoint: str, **kwargs) -> Dict:
         """发送单次HTTP请求并处理响应"""
         endpoint = endpoint.lstrip("/")
-        response = cls._client.request(method, endpoint, **kwargs)
+        full_url = f"{cls.base_url.rstrip('/')}/{endpoint}"
+
+        # --- 添加调试日志 ---
+        print("--------------------------------------------------")
+        print(f"DEBUG: Sending Request To Manager-API (using requests)")
+        print(f"DEBUG: Method: {method}")
+        print(f"DEBUG: URL: {full_url}")
+        print(f"DEBUG: Headers: {cls._session.headers}")
+        print(f"DEBUG: Body: {kwargs.get('json')}")
+        print("--------------------------------------------------")
+        # --- 调试日志结束 ---
+
+        response = cls._session.request(
+            method, 
+            full_url, 
+            timeout=cls.config.get("timeout", 30),
+            **kwargs
+        )
         response.raise_for_status()
 
         result = response.json()
@@ -83,13 +99,11 @@ class ManageApiClient:
     def _should_retry(cls, exception: Exception) -> bool:
         """判断异常是否应该重试"""
         # 网络连接相关错误
-        if isinstance(
-            exception, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)
-        ):
+        if isinstance(exception, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
             return True
 
         # HTTP状态码错误
-        if isinstance(exception, httpx.HTTPStatusError):
+        if isinstance(exception, requests.exceptions.HTTPError):
             status_code = exception.response.status_code
             return status_code in [408, 429, 500, 502, 503, 504]
 
@@ -120,9 +134,26 @@ class ManageApiClient:
     @classmethod
     def safe_close(cls):
         """安全关闭连接池"""
-        if cls._client:
-            cls._client.close()
+        if cls._session:
+            cls._session.close()
             cls._instance = None
+
+    def _initialize_client(cls):
+        """初始化httpx客户端"""
+        if cls._session is None:
+            cls._secret = cls.config.get("secret")
+            cls.max_retries = cls.config.get("max_retries", 2)
+            cls.retry_delay = cls.config.get("retry_delay", 5)
+            headers = {
+                "Content-Type": "application/json",
+            }
+            cls._session = requests.Session()
+            cls._session.headers.update({
+                "User-Agent": f"PythonClient/2.0 (PID:{os.getpid()})",
+                "Accept": "application/json",
+                "Authorization": "Bearer " + cls._secret,
+            })
+            cls.base_url = cls.config.get("url")
 
 
 def get_server_config() -> Optional[Dict]:

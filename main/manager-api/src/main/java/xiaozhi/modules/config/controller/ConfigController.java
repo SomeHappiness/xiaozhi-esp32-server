@@ -29,6 +29,7 @@ public class ConfigController {
     @PostMapping("server-base")
     @Operation(summary = "服务端获取配置接口")
     public Result<Object> getConfig() {
+        System.out.println("-------getConfig");
         Object config = configService.getConfig(true);
         return new Result<Object>().ok(config);
     }

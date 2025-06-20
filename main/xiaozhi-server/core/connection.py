@@ -643,7 +643,7 @@ class ConnectionHandler:
                     self.dialogue.get_llm_dialogue_with_memory(memory_str),
                 )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query!r}: {e!r}")
             return None
 
         # 处理流式响应
@@ -720,7 +720,7 @@ class ConnectionHandler:
                     response_message.append(content_arguments)
                 if bHasError:
                     self.logger.bind(tag=TAG).error(
-                        f"function call error: {content_arguments}"
+                        f"function call error: {content_arguments!r}"
                     )
             if not bHasError:
                 response_message.clear()
@@ -755,7 +755,7 @@ class ConnectionHandler:
                             action=Action.REQLLM, result=result, response=""
                         )
                     except Exception as e:
-                        self.logger.bind(tag=TAG).error(f"MCP工具调用失败: {e}")
+                        self.logger.bind(tag=TAG).error(f"MCP工具调用失败: {e!r}")
                         result = ActionResponse(
                             action=Action.REQLLM, result="MCP工具调用失败", response=""
                         )
