@@ -16,6 +16,8 @@ from core.utils.util import (
     check_vad_update,
     check_asr_update,
     filter_sensitive_info,
+    get_pcm_from_opus,
+    check_config_change,
 )
 from typing import Dict, Any
 from core.mcp.manager import MCPManager
@@ -50,6 +52,15 @@ class TTSException(RuntimeError):
 
 
 class ConnectionHandler:
+    """
+    连接处理器 (ConnectionHandler) - 每个WebSocket连接的专属"管家"
+
+    这个类负责处理单个设备（客户端）的完整生命周期。
+    从WebSocket连接建立开始，到接收、处理音频流，再到与VAD, ASR, LLM, TTS等核心模块交互，
+    最后到连接断开，所有的逻辑都封装在这里。
+    每当有一个新的设备连接，WebSocketServer就会创建一个该类的新实例。
+    """
+
     def __init__(
         self,
         config: Dict[str, Any],
@@ -60,6 +71,18 @@ class ConnectionHandler:
         _intent,
         server=None,
     ):
+        """
+        初始化一个连接处理器实例
+
+        Args:
+            config (Dict[str, Any]): 系统总配置
+            _vad: VAD (语音活动检测) 模块实例
+            _asr: ASR (自动语音识别) 模块实例
+            _llm: LLM (大语言模型) 模块实例
+            _memory: Memory (记忆) 模块实例
+            _intent: Intent (意图识别) 模块实例
+            server: WebSocketServer 的实例，用于回调
+        """
         self.common_config = config
         self.config = copy.deepcopy(config)
         self.session_id = str(uuid.uuid4())
@@ -152,72 +175,43 @@ class ConnectionHandler:
         # {"mcp":true} 表示启用MCP功能
         self.features = None
 
+        self._initialize_components()
+
     async def handle_connection(self, ws):
+        """
+        处理一个完整的WebSocket连接生命周期
+
+        这是此类的主循环，负责持续接收客户端消息，并将其路由到相应的处理逻辑。
+
+        Args:
+            ws: 当前的WebSocket连接对象
+        """
+        self.ws = ws
+        self.logger.bind(tag=TAG).info(f"新客户端接入: {self.session_id}")
+        self.tts.set_websocket(ws)
+        self.tts.start()
+
         try:
-            # 获取并验证headers
-            self.headers = dict(ws.request.headers)
-
-            if self.headers.get("device-id", None) is None:
-                # 尝试从 URL 的查询参数中获取 device-id
-                from urllib.parse import parse_qs, urlparse
-
-                # 从 WebSocket 请求中获取路径
-                request_path = ws.request.path
-                if not request_path:
-                    self.logger.bind(tag=TAG).error("无法获取请求路径")
-                    return
-                parsed_url = urlparse(request_path)
-                query_params = parse_qs(parsed_url.query)
-                if "device-id" in query_params:
-                    self.headers["device-id"] = query_params["device-id"][0]
-                    self.headers["client-id"] = query_params["client-id"][0]
-                else:
-                    await ws.send("端口正常，如需测试连接，请使用test_page.html")
-                    await self.close(ws)
-                    return
-            # 获取客户端ip地址
-            self.client_ip = ws.remote_address[0]
-            self.logger.bind(tag=TAG).info(
-                f"{self.client_ip} conn - Headers: {self.headers}"
-            )
-
-            # 进行认证
-            await self.auth.authenticate(self.headers)
-
-            # 认证通过,继续处理
-            self.websocket = ws
-            self.device_id = self.headers.get("device-id", None)
-
-            # 启动超时检查任务
-            self.timeout_task = asyncio.create_task(self._check_timeout())
-
-            self.welcome_msg = self.config["xiaozhi"]
-            self.welcome_msg["session_id"] = self.session_id
-            await self.websocket.send(json.dumps(self.welcome_msg))
-
-            # 获取差异化配置
-            self._initialize_private_config()
-            # 异步初始化
-            self.executor.submit(self._initialize_components)
-
-            try:
-                async for message in self.websocket:
-                    await self._route_message(message)
-            except websockets.exceptions.ConnectionClosed:
-                self.logger.bind(tag=TAG).info("客户端断开连接")
-
-        except AuthenticationError as e:
-            self.logger.bind(tag=TAG).error(f"Authentication failed: {str(e)}")
-            return
+            # 启动一个后台任务，用于检测长时间无语音输入导致的超时
+            timeout_task = asyncio.create_task(self._check_timeout())
+            # 持续监听来自客户端的消息
+            async for message in ws:
+                # 每收到一条消息，就重置超时计时器
+                await self.reset_timeout()
+                # 将消息路由到具体处理函数
+                await self._route_message(message)
+        except websockets.exceptions.ConnectionClosed as e:
+            self.logger.bind(tag=TAG).info(f"客户端断开连接: {self.session_id}, code={e.code}, reason={e.reason}")
         except Exception as e:
-            stack_trace = traceback.format_exc()
-            self.logger.bind(tag=TAG).error(f"Connection error: {str(e)}-{stack_trace}")
-            return
+            self.logger.bind(tag=TAG).error(f"连接处理异常: {self.session_id}, error: {e!r}")
         finally:
+            # 确保无论何种原因退出，都能正确关闭和清理资源
+            if not timeout_task.done():
+                timeout_task.cancel()
             await self._save_and_close(ws)
 
     async def _save_and_close(self, ws):
-        """保存记忆并关闭连接"""
+        """关闭连接前的清理工作"""
         try:
             if self.memory:
                 # 使用线程池异步保存记忆
@@ -243,72 +237,85 @@ class ConnectionHandler:
             await self.close(ws)
 
     async def reset_timeout(self):
-        """重置超时计时器"""
-        if self.timeout_task:
-            self.timeout_task.cancel()
-        self.timeout_task = asyncio.create_task(self._check_timeout())
+        """重置无语音超时计时器"""
+        self.last_voice_time = time.time()
 
     async def _route_message(self, message):
-        """消息路由"""
-        # 重置超时计时器
-        await self.reset_timeout()
+        """
+        消息路由器
 
+        根据接收到的消息类型（字符串或字节流），决定下一步操作。
+
+        Args:
+            message: 从客户端接收到的原始消息
+        """
         if isinstance(message, str):
-            await handleTextMessage(self, message)
-        elif isinstance(message, bytes):
-            if self.vad is None:
-                return
-            if self.asr is None:
-                return
-            self.asr_audio_queue.put(message)
+            # 如果是字符串，通常是控制指令（如 "restart"）
+            await self.handle_restart(message)
+        else:
+            # 如果是字节流，代表是 Opus 编码的音频数据
+            # 1. 解码 Opus 音频
+            pcm_data = get_pcm_from_opus(message)
+            # 2. 将 PCM 音频送入 VAD 进行语音活动检测
+            speech_dict = await self._vad.iterator(pcm_data)
+
+            if speech_dict:
+                # 3. 如果检测到语音，将其送入 ASR 进行识别
+                text = await self._asr.recognize(speech_dict["speech"])
+                if text:
+                    self.logger.bind(tag=TAG).debug(f"识别结果: {text}")
+                    # 4. 如果LLM当前空闲，则用识别到的文本开始新的对话
+                    if self.llm_finish_task:
+                        self.llm_finish_task = False
+                        self.llm_task = asyncio.create_task(self.chat(text))
 
     async def handle_restart(self, message):
-        """处理服务器重启请求"""
-        try:
+        """处理重启指令"""
+        if "restart" in message:
+            try:
+                self.logger.bind(tag=TAG).info("收到服务器重启指令，准备执行...")
 
-            self.logger.bind(tag=TAG).info("收到服务器重启指令，准备执行...")
-
-            # 发送确认响应
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "type": "server",
-                        "status": "success",
-                        "message": "服务器重启中...",
-                        "content": {"action": "restart"},
-                    }
+                # 发送确认响应
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": "server",
+                            "status": "success",
+                            "message": "服务器重启中...",
+                            "content": {"action": "restart"},
+                        }
+                    )
                 )
-            )
 
-            # 异步执行重启操作
-            def restart_server():
-                """实际执行重启的方法"""
-                time.sleep(1)
-                self.logger.bind(tag=TAG).info("执行服务器重启...")
-                subprocess.Popen(
-                    [sys.executable, "app.py"],
-                    stdin=sys.stdin,
-                    stdout=sys.stdout,
-                    stderr=sys.stderr,
-                    start_new_session=True,
+                # 异步执行重启操作
+                def restart_server():
+                    """实际执行重启的方法"""
+                    time.sleep(1)
+                    self.logger.bind(tag=TAG).info("执行服务器重启...")
+                    subprocess.Popen(
+                        [sys.executable, "app.py"],
+                        stdin=sys.stdin,
+                        stdout=sys.stdout,
+                        stderr=sys.stderr,
+                        start_new_session=True,
+                    )
+                    os._exit(0)
+
+                # 使用线程执行重启避免阻塞事件循环
+                threading.Thread(target=restart_server, daemon=True).start()
+
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(f"重启失败: {str(e)}")
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": "server",
+                            "status": "error",
+                            "message": f"Restart failed: {str(e)}",
+                            "content": {"action": "restart"},
+                        }
+                    )
                 )
-                os._exit(0)
-
-            # 使用线程执行重启避免阻塞事件循环
-            threading.Thread(target=restart_server, daemon=True).start()
-
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"重启失败: {str(e)}")
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "type": "server",
-                        "status": "error",
-                        "message": f"Restart failed: {str(e)}",
-                        "content": {"action": "restart"},
-                    }
-                )
-            )
 
     def _initialize_components(self):
         try:
@@ -599,7 +606,26 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
+    """
+        大模型处理用户消息: 
+    """
     def chat(self, query, tool_call=False):
+        """
+        核心对话处理函数
+
+        这个函数是驱动整个智能对话流程的大脑。它负责：
+        1.  与记忆模块交互，获取历史对话。
+        2.  根据意图识别类型，准备工具函数（Function Calling）。
+        3.  调用大语言模型（LLM），并获取流式响应。
+        4.  处理LLM的响应，包括纯文本和工具调用。
+        5.  将纯文本响应传递给TTS进行播放。
+        6.  执行工具调用并处理其结果。
+        7.  将对话内容存入记忆。
+
+        Args:
+            query (str): ASR识别出的用户最新提问。
+            tool_call (bool): 是否强制进行工具调用（通常在处理工具调用结果时为True）。
+        """
         self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
         self.llm_finish_task = False
 
@@ -787,6 +813,7 @@ class ConnectionHandler:
         return True
 
     def _handle_mcp_tool_call(self, function_call_data):
+        """处理服务端的MCP工具调用"""
         function_arguments = function_call_data["arguments"]
         function_name = function_call_data["name"]
         try:
@@ -829,6 +856,17 @@ class ConnectionHandler:
         return ActionResponse(action=Action.REQLLM, result="工具调用出错", response="")
 
     def _handle_function_result(self, result, function_call_data):
+        """
+        处理工具调用（Function Calling）的执行结果
+
+        当一个本地函数（如查询天气）被执行后，此方法被调用。
+        它会将函数的返回结果包装成一个特定的消息格式，然后再次调用 `chat` 函数，
+        将这个结果喂给大模型，让大模型基于这个结果生成最终的自然语言回复。
+
+        Args:
+            result (ActionResponse): 工具函数的执行结果对象。
+            function_call_data (dict): 原始的工具调用请求数据。
+        """
         if result.action == Action.RESPONSE:  # 直接回复前端
             text = result.response
             self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
